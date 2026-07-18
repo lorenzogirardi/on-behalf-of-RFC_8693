@@ -166,6 +166,30 @@ horizontal by replica count; the HPA targets CPU. mcp-mock and webapp are
 demo-grade singletons that also happen to scale (sessions are re-initialized
 per MCP conversation; webapp event feed is per-replica cosmetic).
 
+## 4b. Found *by* the new observability (post-review validation)
+
+The dashboards paid for themselves within hours — four latent defects became
+visible that log-grepping had never surfaced:
+
+1. **Test 2.3 silently exercised the HMAC fallback on every run** (fixed,
+   `c676e28`). It passed the user JWT as `Authorization`, so obo-exchange used
+   it as actor_token and Keycloak rejected the exchange. Additionally,
+   dev-mode Keycloak derives the token `iss` from the request Host header:
+   tokens minted via `localhost:8180` are rejected as `invalid_token` by the
+   in-network exchange at `keycloak:8080`. The fallback-ratio stat sat at 50%
+   and pointed straight at it. The test now logs in through the webapp
+   (internal issuer) and **fails** when the exchange degrades.
+2. **Real RS256 grants were not renewable** (fixed, `c676e28`). Keycloak
+   omits `refresh_token` when `requested_token_type=access_token` — only
+   fallback tokens carried an RT, so the POC's core "renewability" property
+   worked only on the degraded path. obo-exchange now requests the
+   `refresh_token` type when the scope includes `offline_access`; test 2.5
+   exercises the real Keycloak refresh.
+3. **webapp /run 500 on agent timeout** (fixed, `2d41f78`) — unhandled
+   `httpx.ReadTimeout` under concurrent runs; now a clean 504/502.
+4. **mcp-mock 500 on `"params": null`** (fixed, `2d41f78`) — LLM-driven
+   JSON-RPC clients send explicit nulls; `.get(k, {})` does not cover them.
+
 ## 5. Deferred (explicitly out of scope, in priority order)
 
 1. JWKS signature verification + per-tool RBAC in mcp-mock (§1.2)
