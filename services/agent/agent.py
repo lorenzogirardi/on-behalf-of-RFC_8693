@@ -1,11 +1,12 @@
 """
-Agent POC — sincronous tool-calling loop con OBO identity.
-Identico alla versione di produzione ma senza Dapr (Redis diretto).
+Agent POC — synchronous tool-calling loop with OBO identity.
+Same shape as the production version but without Dapr (direct Redis).
 """
 from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import time
 import uuid
@@ -14,21 +15,42 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from prometheus_client import Counter, Histogram
 from starlette.concurrency import run_in_threadpool
 
 from grant_store import GrantStore
 from obo import Grant, OBOClient
+from obs import setup_observability
 
 GATEWAY_BASE = os.getenv("GATEWAY_BASE", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://litellm:4000/v1")
 MCP_BASE_URL = os.getenv("MCP_BASE_URL", "http://mcp-mock:8083")
+OBO_EXCHANGE_BASE = os.getenv("OBO_EXCHANGE_BASE", "http://obo-exchange:8081")
 DEFAULT_MODEL = os.getenv("AGENT_MODEL", "gpt-4o-mini")
 MAX_TURNS = int(os.getenv("AGENT_MAX_TURNS", "6"))
+# Small local models on SBC hardware can take minutes per turn
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
 MCP_PROTOCOL_VERSION = "2025-06-18"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("agent")
 
 _obo = OBOClient.from_env()
 _store = GrantStore.from_env(_obo)
 _http = httpx.Client(timeout=60.0)
+
+RUNS = Counter("agent_runs_total", "Agent task runs", ["status"])
+RUN_DURATION = Histogram("agent_run_duration_seconds", "Agent run wall time",
+                         buckets=(0.5, 1, 2.5, 5, 10, 30, 60, 120, 300))
+LLM_REQUESTS = Counter("agent_llm_requests_total", "LLM chat-completion calls", ["status"])
+LLM_DURATION = Histogram("agent_llm_request_duration_seconds", "LLM call latency",
+                         buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60))
+MCP_REQUESTS = Counter("agent_mcp_requests_total", "MCP calls made by the agent",
+                       ["method", "tool", "status"])
+MCP_DURATION = Histogram("agent_mcp_request_duration_seconds", "MCP call latency",
+                         ["method"],
+                         buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10))
+GRANT_REFRESHES = Counter("agent_grant_refresh_total", "OBO grant refreshes", ["result"])
 
 
 def _decode_jwt(token: str) -> dict:
@@ -82,24 +104,29 @@ def _mcp_call(token: str, method: str, params: dict) -> dict:
 def _mcp_with_trace(run_id: str, token: str, method: str, params: dict) -> dict:
     claims = _decode_jwt(token)
     act = claims.get("act") or {}
+    tool = params.get("name") or "-"
     entry = {
         "hop": "mcp", "method": method, "tool": params.get("name"),
         "ts": int(time.time()),
         "presented_identity": {"sub": claims.get("sub"), "act_sub": act.get("sub")},
         "token_exp": claims.get("exp"),
     }
+    t0 = time.perf_counter()
     try:
         result = _mcp_call(token, method, params)
         entry["ok"] = True
-        print(f"[MCP] run={run_id} {method} tool={params.get('name')} "
-              f"sub={claims.get('sub')} act={act.get('sub')} ok=True", flush=True)
+        MCP_REQUESTS.labels(method, tool, "ok").inc()
+        log.info(f"[MCP] run={run_id} {method} tool={params.get('name')} "
+                 f"sub={claims.get('sub')} act={act.get('sub')} ok=True")
         return result
     except Exception as e:
         entry["ok"] = False
         entry["error"] = str(e)
-        print(f"[MCP] run={run_id} {method} FAILED: {e}", flush=True)
+        MCP_REQUESTS.labels(method, tool, "error").inc()
+        log.error(f"[MCP] run={run_id} {method} FAILED: {e}")
         raise
     finally:
+        MCP_DURATION.labels(method).observe(time.perf_counter() - t0)
         _store.append_trace(run_id, entry)
 
 
@@ -135,10 +162,15 @@ TOOL_SCHEMAS = [
 def _live_token(state: dict) -> str:
     grant = state["grant"]
     if grant.near_expiry() and grant.refresh_token:
-        grant = _obo.refresh(grant)
+        try:
+            grant = _obo.refresh(grant)
+        except Exception:
+            GRANT_REFRESHES.labels("error").inc()
+            raise
         state["grant"] = grant
         _store.save(state["run_id"], grant)
-        print(f"[OBO] run={state['run_id']} refreshed grant", flush=True)
+        GRANT_REFRESHES.labels("ok").inc()
+        log.info(f"[OBO] run={state['run_id']} refreshed grant")
     return state["grant"].access_token
 
 
@@ -161,7 +193,7 @@ def _exec_tool(state: dict, name: str, arguments: str) -> str:
 def run_task(run_id: str, grant: Grant, task: str) -> str:
     from openai import OpenAI
     state = {"grant": grant, "run_id": run_id}
-    llm_http = httpx.Client(timeout=60.0)
+    llm_http = httpx.Client(timeout=LLM_TIMEOUT)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": task},
@@ -169,9 +201,17 @@ def run_task(run_id: str, grant: Grant, task: str) -> str:
     for _ in range(MAX_TURNS):
         token = _live_token(state)
         client = OpenAI(api_key=token, base_url=LLM_BASE_URL, http_client=llm_http)
-        resp = client.chat.completions.create(
-            model=DEFAULT_MODEL, messages=messages, tools=TOOL_SCHEMAS, tool_choice="auto",
-        )
+        t0 = time.perf_counter()
+        try:
+            resp = client.chat.completions.create(
+                model=DEFAULT_MODEL, messages=messages, tools=TOOL_SCHEMAS, tool_choice="auto",
+            )
+            LLM_REQUESTS.labels("ok").inc()
+        except Exception:
+            LLM_REQUESTS.labels("error").inc()
+            raise
+        finally:
+            LLM_DURATION.observe(time.perf_counter() - t0)
         msg = resp.choices[0].message
         if not msg.tool_calls:
             return msg.content or ""
@@ -203,9 +243,18 @@ def _grant_from_headers(headers) -> Grant | None:
 app = FastAPI(title="agent-poc")
 
 
-@app.get("/healthz")
-def healthz():
-    return {"status": "ok", "service": "agent-poc"}
+async def _check_ready() -> dict[str, bool]:
+    deps = {"redis": _store.ping()}
+    try:
+        async with httpx.AsyncClient(timeout=3) as c:
+            r = await c.get(f"{OBO_EXCHANGE_BASE}/healthz")
+        deps["obo_exchange"] = r.status_code == 200
+    except Exception:
+        deps["obo_exchange"] = False
+    return deps
+
+
+setup_observability(app, "agent-poc", readiness_check=_check_ready)
 
 
 @app.post("/a2a/run")
@@ -221,8 +270,8 @@ async def a2a_run(request: Request):
     run_id = uuid.uuid4().hex
     _store.save(run_id, grant)
     claims = _decode_jwt(grant.access_token)
-    print(f"[OBO] run={run_id} sub={claims.get('sub')} act={(claims.get('act') or {}).get('sub')} "
-          f"has_refresh={bool(grant.refresh_token)}", flush=True)
+    log.info(f"[OBO] run={run_id} sub={claims.get('sub')} act={(claims.get('act') or {}).get('sub')} "
+             f"has_refresh={bool(grant.refresh_token)}")
     # Emit identity event for webapp
     ev = json.dumps({
         "ts": int(time.time()), "stage": "agent.run_start",
@@ -231,12 +280,15 @@ async def a2a_run(request: Request):
         "task": task[:100],
     })
     print(f"[IDENTITY_EVENT] {ev}", flush=True)
+    t0 = time.perf_counter()
     try:
         result = await run_in_threadpool(run_task, run_id, grant, task)
         status = "COMPLETED"
     except Exception as e:
         result, status = str(e), "FAILED"
-        print(f"[RUN] run={run_id} FAILED: {e}", flush=True)
+        log.error(f"[RUN] run={run_id} FAILED: {e}")
+    RUNS.labels(status).inc()
+    RUN_DURATION.observe(time.perf_counter() - t0)
     return {"instance_id": run_id, "runtime_status": status, "result": result}
 
 

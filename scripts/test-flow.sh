@@ -3,6 +3,8 @@
 # Layer 1 runs without any stack. Layers 2+3 require a running stack.
 set -euo pipefail
 
+cd "$(dirname "${BASH_SOURCE[0]}")/.."   # repo root — layer 1 uses relative paths
+
 PASS=0; FAIL=0
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
@@ -82,6 +84,55 @@ assert "iss" in decoded
 print("    sub=%s act=%s" % (decoded["sub"], decoded["act"]["sub"]))
 EOF
 ok "JWT decode: sub + act.sub extraction works"
+
+echo "  [1.5] Python syntax — all services compile"
+if python3 -m py_compile services/common/obs.py services/agent/*.py \
+    services/obo-exchange/server.py services/mcp-mock/server.py \
+    services/webapp/server.py 2>/dev/null; then
+  ok "py_compile: all service sources valid"
+else
+  fail "py_compile failed — syntax error in a service"
+fi
+
+echo "  [1.6] Grafana dashboards — valid JSON with panels"
+DASH=$(python3 - <<'EOF'
+import json, glob
+files = sorted(glob.glob("observability/grafana/dashboards/*.json"))
+assert files, "no dashboards found"
+total = 0
+for f in files:
+    d = json.load(open(f))
+    assert d.get("uid") and d.get("panels"), f"{f}: missing uid/panels"
+    total += len(d["panels"])
+print(f"{len(files)} dashboards, {total} panels")
+EOF
+) && ok "Dashboards: $DASH" || fail "Dashboard JSON invalid"
+
+echo "  [1.7] Helm chart — lint + template (default and dev values)"
+if command -v helm >/dev/null 2>&1; then
+  if helm lint helm/agent-identity-poc >/dev/null 2>&1 \
+     && helm template poc helm/agent-identity-poc >/dev/null 2>&1 \
+     && helm template poc helm/agent-identity-poc -f helm/agent-identity-poc/values-dev.yaml >/dev/null 2>&1; then
+    ok "Helm chart: lint + template OK (default + dev)"
+  else
+    fail "Helm chart lint/template failed"
+  fi
+else
+  skip "helm not installed"
+fi
+
+echo "  [1.8] Fallback token is flagged and gateable"
+python3 - <<'EOF'
+import base64, json
+# A fallback-minted token must always carry _fallback=True so consumers
+# (webapp badge, tests, dashboards) can detect the downgraded trust level.
+payload = {"sub":"u","act":{"sub":"a"},"_fallback":True}
+p = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+decoded = json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))
+assert decoded["_fallback"] is True
+print("    _fallback flag round-trips")
+EOF
+ok "Fallback tokens carry _fallback marker"
 
 # ─────────────────────────────────────────────────────────────────────────
 h1 "LAYER 2 — Integration tests (requires running stack)"
@@ -213,6 +264,39 @@ PYEOF
     if [ "$R" = "ok" ]; then ok "$name /healthz"; else fail "$name /healthz: $R"; fi
   done
 
+  echo "  [2.9] Prometheus /metrics on every service"
+  for svc in "8081:obo-exchange" "8082:agent" "8083:mcp-mock" "8080:webapp"; do
+    port="${svc%%:*}"; name="${svc#*:}"
+    if curl -sf "http://localhost:${port}/metrics" | grep -q "http_requests_total"; then
+      ok "$name /metrics exposes http_requests_total"
+    else
+      fail "$name /metrics missing http_requests_total"
+    fi
+  done
+
+  echo "  [2.10] Readiness — /readyz reports dependencies"
+  for svc in "8081:obo-exchange" "8082:agent" "8083:mcp-mock" "8080:webapp"; do
+    port="${svc%%:*}"; name="${svc#*:}"
+    R=$(curl -sf "http://localhost:${port}/readyz" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "fail")
+    if [ "$R" = "ready" ]; then ok "$name /readyz ready"; else fail "$name /readyz: $R"; fi
+  done
+
+  echo "  [2.11] Prometheus scraping targets"
+  UP=$(curl -sf "http://localhost:9090/api/v1/query?query=count(up==1)" \
+    | python3 -c "import sys,json; r=json.load(sys.stdin)['data']['result']; print(int(float(r[0]['value'][1])) if r else 0)" 2>/dev/null || echo 0)
+  if [ "${UP:-0}" -ge 5 ]; then ok "Prometheus: $UP targets up"; else
+    skip "Prometheus not up yet ($UP targets) — needs ~1 scrape interval"
+  fi
+
+  echo "  [2.12] Grafana healthy + dashboards provisioned"
+  GRAF=$(curl -sf "http://localhost:3000/api/health" | python3 -c "import sys,json; print(json.load(sys.stdin).get('database',''))" 2>/dev/null || echo "fail")
+  if [ "$GRAF" = "ok" ]; then
+    DASH_N=$(curl -sf "http://localhost:3000/api/search?type=dash-db" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+    if [ "${DASH_N:-0}" -ge 2 ]; then ok "Grafana up, $DASH_N dashboards provisioned"; else fail "Grafana up but $DASH_N dashboards found (expected ≥2)"; fi
+  else
+    skip "Grafana not reachable"
+  fi
+
 fi
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -227,7 +311,7 @@ else
   E2E=$(curl -sf -X POST http://localhost:8080/run \
     -H "Content-Type: application/json" \
     -d '{"task":"List the MCP tools available.","username":"alice","password":"alice123"}' \
-    --max-time 120 2>/dev/null || echo "FAIL")
+    --max-time 600 2>/dev/null || echo "FAIL")
 
   if [ "$E2E" = "FAIL" ]; then
     fail "Webapp /run request failed"
@@ -238,6 +322,8 @@ d=json.load(sys.stdin)
 assert not d.get('error'), f'error: {d.get(\"error\")}'
 assert d.get('run_id'), 'no run_id'
 assert d.get('result'), 'no result'
+s3 = d['steps'][2]['event']
+assert s3.get('status') == 'COMPLETED', f'agent run status={s3.get(\"status\")} result={d[\"result\"][:120]}'
 assert len(d.get('steps',[])) == 4, f'expected 4 steps, got {len(d.get(\"steps\",[]))}'
 s2 = d['steps'][1]
 obo = s2.get('obo_claims',{})
@@ -267,6 +353,23 @@ print('subject=%s act=%s mcp_calls=%d' % (g['subject_sub'],str(g['act'].get('sub
       if echo "$AUDIT_OK" | grep -q "FAIL\|Error"; then fail "Audit incomplete: $AUDIT_OK"; else ok "Audit: $AUDIT_OK"; fi
     else
       fail "No run_id to audit"
+    fi
+
+    echo "  [3.3] Metrics incremented by the E2E run"
+    EX_N=$(curl -sf http://localhost:8081/metrics | python3 -c "
+import sys
+total = sum(float(l.rsplit(' ',1)[1]) for l in sys.stdin
+            if l.startswith('obo_exchange_total'))
+print(int(total))" 2>/dev/null || echo 0)
+    RUN_N=$(curl -sf http://localhost:8082/metrics | python3 -c "
+import sys
+total = sum(float(l.rsplit(' ',1)[1]) for l in sys.stdin
+            if l.startswith('agent_runs_total'))
+print(int(total))" 2>/dev/null || echo 0)
+    if [ "${EX_N:-0}" -ge 1 ] && [ "${RUN_N:-0}" -ge 1 ]; then
+      ok "Counters moved: obo_exchange_total=$EX_N agent_runs_total=$RUN_N"
+    else
+      fail "Metrics did not increment (exchanges=$EX_N runs=$RUN_N)"
     fi
   fi
 

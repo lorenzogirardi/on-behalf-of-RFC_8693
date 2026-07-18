@@ -53,6 +53,8 @@ Everything runs locally in Docker/Podman — no cloud, no VPN, no TLS setup.
 | 4000 | `poc-litellm` | OpenAI-compatible LLM proxy (Ollama / OpenAI / Anthropic) |
 | 8080 | `poc-webapp` | Identity-flow visualizer UI (simulates the gateway) |
 | 6379 | `poc-redis` | Grant store (AES-256-GCM encrypted OBO grants) |
+| 9090 | `poc-prometheus` | Metrics — scrapes every service + Keycloak + Redis |
+| 3000 | `poc-grafana` | Dashboards (anonymous admin, auto-provisioned) |
 
 Demo users: `alice/alice123`, `bob/bob123`. Keycloak admin: `admin/admin`.
 All secrets in this repo are demo values for the local stack only.
@@ -92,15 +94,22 @@ Subsequent starts: ~10 seconds.
   every JWT decoded on screen. Step 2 should show `fallback=False` and
   `alg=RS256` — meaning Keycloak performed the real RFC 8693 exchange.
 - **http://localhost:8180/admin** — Keycloak console (`admin/admin`, realm `poc`).
+- **http://localhost:3000** — Grafana with two provisioned dashboards:
+  *Agent Identity — Delegation Flow* (exchange rate, **fallback ratio**, run
+  outcomes, per-tool MCP traffic, hop latencies) and *Agent Identity — Service
+  RED* (rate/errors/duration per service). Prometheus raw at
+  **http://localhost:9090**.
 
 ### Verify
 
 ```bash
-./scripts/test-flow.sh   # 16 tests: unit → integration → E2E
+./scripts/test-flow.sh   # test pyramid: unit → integration → E2E
 ```
 
-Expected: `16 passed  0 failed`. The key E2E assertion is `fallback=False`
-(real Keycloak RS256 exchange, not the local HMAC fallback).
+Expected with the full stack up: `31 passed  0 failed` (8 unit checks run
+even without the stack). Key assertions: `fallback=False` (real Keycloak
+RS256 exchange, not the local HMAC fallback) and metrics counters actually
+incrementing after the E2E run.
 
 ### Watch the identity flow in logs
 
@@ -130,8 +139,11 @@ curl http://localhost:8082/admin/instances/$RUN_ID/trace    | python3 -m json.to
 ```
 ARCHITECTURE.md          ← diagrams, auth enforcement guide, token anatomy
 MANUAL.md                ← technical explanation of each component
+docs/CRITICAL_REVIEW.md  ← EA/SRE review: findings, fixes, deferred roadmap
 docker-compose.yml       ← full stack definition
 config/litellm.yaml      ← LiteLLM model routing
+observability/           ← prometheus.yml + Grafana provisioning/dashboards
+helm/agent-identity-poc  ← Helm chart: k8s deploy, every component optional
 
 services/
   keycloak-setup/
@@ -149,9 +161,40 @@ services/
 
 scripts/
   start.sh / stop.sh / logs.sh
-  test-flow.sh                     ← the 16-test pyramid
+  test-flow.sh                     ← the test pyramid (31 checks with stack up)
   fix-keycloak-token-exchange.sh   ← repairs the RFC 8693 permission if setup failed
 ```
+
+### Observability
+
+Every Python service exposes:
+
+- `GET /metrics` — Prometheus (RED metrics per route + domain metrics:
+  `obo_exchange_total{result}`, `agent_runs_total{status}`,
+  `agent_mcp_requests_total{tool}`, `mcp_tool_calls_total`,
+  `webapp_flows_total{fallback}`, …)
+- `GET /healthz` — liveness (process up)
+- `GET /readyz` — readiness (critical dependencies reachable; 503 otherwise)
+
+The one metric to watch: **`obo_exchange_total{result="fallback"}`** — any
+nonzero rate means Keycloak stopped doing real RFC 8693 exchanges and the
+broker minted locally-signed demo tokens instead. The Grafana *Delegation
+Flow* dashboard turns this into a red ratio stat.
+
+![Webapp — identity delegation chain](docs/screenshots/webapp-flow.png)
+
+![Grafana — delegation flow dashboard](docs/screenshots/grafana-identity-flow.png)
+
+![Grafana — service RED dashboard](docs/screenshots/grafana-service-red.png)
+
+### Kubernetes (Helm)
+
+`helm/agent-identity-poc` deploys the stack with every component optional and
+externally wireable — point `config.kcIssuer` at an existing Keycloak,
+`config.redisUrl` at an existing Redis, disable `litellm` in favor of your
+LLM gateway. Default values fail closed (`ALLOW_LOCAL_FALLBACK=false`), run
+non-root with read-only rootfs, and ship HPAs for obo-exchange and agent.
+See [helm/README.md](helm/README.md).
 
 ### Development loop
 

@@ -1,0 +1,149 @@
+# Default values target a "bring your own infrastructure" install:
+#   - external Keycloak (set config.kcIssuer)
+#   - external Redis   (set config.redisUrl)
+#   - fail-closed OBO  (allowLocalFallback "false")
+# For a fully self-contained cluster demo use:  -f values-dev.yaml
+
+image:
+  registry: ghcr.io/lorenzogirardi/on-behalf-of-rfc_8693
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Shared, non-secret configuration (rendered into ConfigMap poc-config).
+config:
+  kcIssuer: "http://keycloak:8080/realms/poc"
+  exchangeAppClientId: "exchange-app"
+  agentClientId: "agent-service"
+  defaultScope: "openid profile email offline_access"
+  oboScope: "openid profile email offline_access"
+  redisUrl: "redis://redis:6379"
+  agentModel: "gpt-4o-mini"
+  # Silent HMAC fallback tokens. Keep "false" anywhere shared: a Keycloak
+  # misconfiguration must fail closed, not mint locally-signed tokens.
+  allowLocalFallback: "false"
+  identityEvents: "true"
+  enableHitl: "0"
+
+# DEMO secrets. Override per environment, or set secrets.create=false and
+# provide an existing Secret (External Secrets Operator, Sealed Secrets, ...).
+secrets:
+  create: true
+  existingSecret: ""          # used when create=false
+  exchangeAppClientSecret: "exchange-app-secret"
+  agentClientSecret: "agent-service-secret"
+  agentStateAeadKey: "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY="
+  openaiApiKey: ""
+  anthropicApiKey: ""
+
+# The four POC services. Each entry becomes Deployment + Service (+ HPA when
+# autoscaling.enabled). Disable any of them and point the URLs in `config`
+# at an existing external deployment instead.
+services:
+  obo-exchange:
+    enabled: true
+    port: 8081
+    replicas: 2
+    env:
+      PORT: "8081"
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+    resources:
+      requests: {cpu: 50m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 256Mi}
+  agent:
+    enabled: true
+    port: 8082
+    replicas: 2
+    env:
+      APP_PORT: "8082"
+      OBO_EXCHANGE_BASE: "http://obo-exchange:8081"
+      MCP_BASE_URL: "http://mcp-mock:8083"
+      LLM_BASE_URL: "http://litellm:4000/v1"
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+    resources:
+      requests: {cpu: 100m, memory: 192Mi}
+      limits: {cpu: "1", memory: 512Mi}
+  mcp-mock:
+    enabled: true
+    port: 8083
+    replicas: 1
+    env:
+      PORT: "8083"
+    autoscaling: {enabled: false}
+    resources:
+      requests: {cpu: 25m, memory: 96Mi}
+      limits: {cpu: 250m, memory: 192Mi}
+  webapp:
+    enabled: true
+    port: 8080
+    replicas: 1
+    env:
+      PORT: "8080"
+      AGENT_URL: "http://agent:8082"
+      OBO_URL: "http://obo-exchange:8081"
+      KC_CLIENT_ID: "poc-webapp"
+    autoscaling: {enabled: false}
+    resources:
+      requests: {cpu: 25m, memory: 96Mi}
+      limits: {cpu: 250m, memory: 192Mi}
+
+# LiteLLM proxy (upstream image). Disable to point LLM_BASE_URL at an
+# existing OpenAI-compatible endpoint (Bedrock gateway, vLLM, ...).
+litellm:
+  enabled: true
+  image: ghcr.io/berriai/litellm:main-latest
+  port: 4000
+  replicas: 1
+  ollamaApiBase: ""           # e.g. http://ollama.ollama.svc:11434
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: "1", memory: 1Gi}
+  # Rendered verbatim as /app/config.yaml
+  config: |
+    model_list:
+      - model_name: gpt-4o-mini
+        litellm_params:
+          model: gpt-4o-mini
+    litellm_settings:
+      drop_params: true
+
+# In-cluster Keycloak for self-contained demos (values-dev.yaml enables it).
+# In real environments keep disabled and use your existing IdP.
+keycloak:
+  enabled: false
+  image: quay.io/keycloak/keycloak:24.0
+  adminPassword: admin
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {cpu: "1", memory: 1Gi}
+
+# In-cluster Redis for self-contained demos.
+redis:
+  enabled: false
+  image: redis:7-alpine
+  resources:
+    requests: {cpu: 25m, memory: 64Mi}
+    limits: {cpu: 250m, memory: 256Mi}
+
+# Pod-level defaults for the POC services.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# prometheus.io/* scrape annotations on every POC pod.
+metrics:
+  annotations: true

@@ -1,4 +1,20 @@
 model_list:
+  # Local llama.cpp server (OpenAI-compatible). Set LOCAL_LLM_BASE in .env.
+  # NOTE: tool calling requires llama-server started with --jinja.
+  - model_name: qwen-local
+    litellm_params:
+      model: openai/Qwen3.5-2B-Claude-Distill
+      api_base: os.environ/LOCAL_LLM_BASE
+      api_key: "none"
+
+  # Any upstream OpenAI-compatible gateway (e.g. another LiteLLM instance).
+  # Set UPSTREAM_LLM_BASE / UPSTREAM_LLM_KEY / UPSTREAM_LLM_MODEL in .env.
+  - model_name: upstream-gateway
+    litellm_params:
+      model: os.environ/UPSTREAM_LLM_MODEL
+      api_base: os.environ/UPSTREAM_LLM_BASE
+      api_key: os.environ/UPSTREAM_LLM_KEY
+
   - model_name: ollama/gemma4-12b-qat
     litellm_params:
       model: ollama_chat/gemma4-12b-qat

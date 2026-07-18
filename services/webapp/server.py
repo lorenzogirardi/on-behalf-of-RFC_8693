@@ -22,16 +22,40 @@ from fastapi import FastAPI
 from fastapi.requests import Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from prometheus_client import Counter, Histogram
+
+from obs import setup_observability
 
 PORT           = int(os.getenv("PORT", "8080"))
 AGENT_URL      = os.getenv("AGENT_URL", "http://agent:8082")
 OBO_URL        = os.getenv("OBO_URL", "http://obo-exchange:8081")
 KC_ISSUER      = os.getenv("KC_ISSUER", "http://keycloak:8080/realms/poc")
 KC_TOKEN_URL   = KC_ISSUER.rstrip("/") + "/protocol/openid-connect/token"
-KC_CLIENT_ID   = "poc-webapp"     # public client, no secret
+KC_CLIENT_ID   = os.getenv("KC_CLIENT_ID", "poc-webapp")   # public client, no secret
+STATIC_DIR     = os.getenv("STATIC_DIR", "/app/static")
 
 app = FastAPI(title="agent-identity-visualizer")
 _events: list[dict] = []
+
+FLOWS = Counter("webapp_flows_total", "Full delegation flows run via /run",
+                ["status", "fallback"])
+FLOW_DURATION = Histogram("webapp_flow_duration_seconds", "End-to-end /run flow wall time",
+                          buckets=(0.5, 1, 2.5, 5, 10, 30, 60, 120, 300))
+
+
+async def _check_ready() -> dict[str, bool]:
+    deps = {}
+    async with httpx.AsyncClient(timeout=3) as c:
+        for name, url in (("agent", AGENT_URL), ("obo_exchange", OBO_URL)):
+            try:
+                r = await c.get(f"{url}/healthz")
+                deps[name] = r.status_code == 200
+            except Exception:
+                deps[name] = False
+    return deps
+
+
+setup_observability(app, "webapp", readiness_check=_check_ready)
 
 
 def _decode_jwt(token: str) -> dict:
@@ -89,6 +113,16 @@ async def login(request: Request):
 
 @app.post("/run")
 async def run_task(request: Request):
+    t0 = time.perf_counter()
+    resp = await _run_flow(request)
+    fallback = "true" if getattr(resp, "_flow_fallback", False) else "false"
+    status = "ok" if resp.status_code == 200 else "failed"
+    FLOWS.labels(status, fallback).inc()
+    FLOW_DURATION.observe(time.perf_counter() - t0)
+    return resp
+
+
+async def _run_flow(request: Request) -> JSONResponse:
     body = await request.json()
     task     = body.get("task", "List the MCP tools you have.")
     username = body.get("username", "alice")
@@ -150,7 +184,7 @@ async def run_task(request: Request):
                           f"act={(obo_claims.get('act') or {}).get('sub')}"})
 
     # ── STEP 3: Agent execution ──────────────────────────────────────────
-    async with httpx.AsyncClient(timeout=120) as c:
+    async with httpx.AsyncClient(timeout=float(os.getenv("AGENT_TIMEOUT_SECONDS", "600"))) as c:
         agent_resp = await c.post(f"{AGENT_URL}/a2a/run",
                                   json={"task": task},
                                   headers={"Authorization": f"Bearer {obo_token}",
@@ -184,12 +218,14 @@ async def run_task(request: Request):
                   "note": "These endpoints are NOT exposed through the gateway. "
                           "Only operators with in-cluster access can read this."})
 
-    return JSONResponse({
+    resp = JSONResponse({
         "run_id": run_id,
         "result": agent_data.get("result"),
         "steps": steps,
         "recent_events": _events[-20:],
     })
+    resp._flow_fallback = is_fallback
+    return resp
 
 
 @app.get("/audit/{run_id}")
@@ -203,14 +239,9 @@ async def audit(run_id: str):
     })
 
 
-@app.get("/healthz")
-def healthz():
-    return {"status": "ok"}
-
-
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    with open("/app/static/index.html") as f:
+    with open(os.path.join(STATIC_DIR, "index.html")) as f:
         return HTMLResponse(f.read())
 
 

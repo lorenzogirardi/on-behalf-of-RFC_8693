@@ -10,12 +10,22 @@ import time
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from prometheus_client import Counter, Gauge
+
+from obs import setup_observability
 
 PORT = int(os.getenv("PORT", "8083"))
+SESSION_TTL = float(os.getenv("MCP_SESSION_TTL_SECONDS", "3600"))
+SESSION_MAX = int(os.getenv("MCP_SESSION_MAX", "1000"))
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mcp-mock")
 
 app = FastAPI(title="mcp-mock")
+setup_observability(app, "mcp-mock")
+
+TOOL_CALLS = Counter("mcp_tool_calls_total", "MCP tool invocations", ["tool"])
+ACTIVE_SESSIONS = Gauge("mcp_sessions_active", "MCP sessions currently tracked")
 
 TOOLS = [
     {
@@ -60,6 +70,17 @@ TOOLS = [
 ]
 
 SESSIONS: dict[str, dict] = {}
+
+
+def _prune_sessions() -> None:
+    """TTL-expire sessions and hard-cap the dict so memory stays bounded."""
+    now = time.time()
+    for sid in [s for s, v in SESSIONS.items() if now - v["created"] > SESSION_TTL]:
+        SESSIONS.pop(sid, None)
+    if len(SESSIONS) > SESSION_MAX:
+        for sid in sorted(SESSIONS, key=lambda s: SESSIONS[s]["created"])[:len(SESSIONS) - SESSION_MAX]:
+            SESSIONS.pop(sid, None)
+    ACTIVE_SESSIONS.set(len(SESSIONS))
 
 
 def _bearer_claims(request: Request) -> dict:
@@ -111,8 +132,10 @@ async def mcp_endpoint(request: Request):
     log.info(f"[MCP] {method} sub={sub} act={act} session={session_id}")
 
     if method == "initialize":
-        new_session = f"mcp-session-{int(time.time())}"
+        _prune_sessions()
+        new_session = f"mcp-session-{int(time.time() * 1000)}"
         SESSIONS[new_session] = {"sub": sub, "act": act, "created": time.time()}
+        ACTIVE_SESSIONS.set(len(SESSIONS))
         return JSONResponse(
             {"jsonrpc": "2.0", "id": id_, "result": {
                 "protocolVersion": "2025-06-18",
@@ -133,17 +156,13 @@ async def mcp_endpoint(request: Request):
         name = params.get("name", "")
         arguments = params.get("arguments", {})
         result_text = _exec_tool(name, arguments)
+        TOOL_CALLS.labels(name or "unknown").inc()
         log.info(f"[MCP] tools/call name={name} by sub={sub} act={act} → {result_text[:80]}")
         return JSONResponse({"jsonrpc": "2.0", "id": id_,
                              "result": {"content": [{"type": "text", "text": result_text}]}})
 
     return JSONResponse({"jsonrpc": "2.0", "id": id_,
                          "error": {"code": -32601, "message": f"Method not found: {method}"}})
-
-
-@app.get("/healthz")
-def healthz():
-    return {"status": "ok", "service": "mcp-mock", "tools": len(TOOLS)}
 
 
 if __name__ == "__main__":

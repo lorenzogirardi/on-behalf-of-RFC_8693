@@ -1,5 +1,3 @@
-version: "3.9"
-
 # Agent Identity POC — self-contained local stack (Podman / Docker)
 # No external services, no VPN, no cloud accounts required.
 #
@@ -11,6 +9,8 @@ version: "3.9"
 #   4000  litellm       — OpenAI-compatible LLM proxy
 #   8180  keycloak      — real Identity Provider (admin: admin/admin)
 #   6379  redis         — grant store
+#   9090  prometheus    — metrics
+#   3000  grafana       — dashboards (anonymous admin)
 
 networks:
   poc-net:
@@ -28,7 +28,7 @@ services:
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
       KC_HEALTH_ENABLED: "true"
-      KC_METRICS_ENABLED: "false"
+      KC_METRICS_ENABLED: "true"
       KC_HTTP_ENABLED: "true"
       KC_HOSTNAME_STRICT: "false"
       KC_HOSTNAME_STRICT_HTTPS: "false"
@@ -79,7 +79,8 @@ services:
     image: ghcr.io/berriai/litellm:main-latest
     container_name: poc-litellm
     networks: [poc-net]
-    ports: ["4000:4000"]
+    # host 4001: 4000 is commonly taken by a standalone litellm install
+    ports: ["4001:4000"]
     volumes:
       - ./config/litellm.yaml:/app/config.yaml:ro
     command: ["--config", "/app/config.yaml", "--port", "4000"]
@@ -87,6 +88,10 @@ services:
       OPENAI_API_KEY: "${OPENAI_API_KEY:-sk-placeholder}"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       OLLAMA_API_BASE: "${OLLAMA_API_BASE:-http://host.containers.internal:11434}"
+      LOCAL_LLM_BASE: "${LOCAL_LLM_BASE:-http://host.docker.internal:8080/v1}"
+      UPSTREAM_LLM_BASE: "${UPSTREAM_LLM_BASE:-http://host.docker.internal:4000/v1}"
+      UPSTREAM_LLM_KEY: "${UPSTREAM_LLM_KEY:-none}"
+      UPSTREAM_LLM_MODEL: "${UPSTREAM_LLM_MODEL:-openai/gpt-4o-mini}"
     healthcheck:
       test: ["CMD", "/usr/bin/python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=3)"]
       interval: 10s
@@ -95,8 +100,11 @@ services:
 
   # ── OBO Exchange ──────────────────────────────────────────────────────
   obo-exchange:
-    build: ./services/obo-exchange
+    build:
+      context: ./services
+      dockerfile: obo-exchange/Dockerfile
     container_name: poc-obo-exchange
+    restart: unless-stopped
     networks: [poc-net]
     ports: ["8081:8081"]
     depends_on:
@@ -111,6 +119,8 @@ services:
       AGENT_CLIENT_SECRET: "agent-service-secret"
       DEFAULT_SCOPE: "openid profile email offline_access"
       IDENTITY_EVENTS: "true"
+      # Demo convenience only — set "false" in any shared environment (fail closed)
+      ALLOW_LOCAL_FALLBACK: "true"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/healthz', timeout=3)"]
       interval: 5s
@@ -119,8 +129,11 @@ services:
 
   # ── MCP Mock ──────────────────────────────────────────────────────────
   mcp-mock:
-    build: ./services/mcp-mock
+    build:
+      context: ./services
+      dockerfile: mcp-mock/Dockerfile
     container_name: poc-mcp-mock
+    restart: unless-stopped
     networks: [poc-net]
     ports: ["8083:8083"]
     environment:
@@ -133,8 +146,11 @@ services:
 
   # ── Agent ──────────────────────────────────────────────────────────────
   agent:
-    build: ./services/agent
+    build:
+      context: ./services
+      dockerfile: agent/Dockerfile
     container_name: poc-agent
+    restart: unless-stopped
     networks: [poc-net]
     ports: ["8082:8082"]
     depends_on:
@@ -148,12 +164,14 @@ services:
       MCP_BASE_URL: "http://mcp-mock:8083"
       OBO_EXCHANGE_BASE: "http://obo-exchange:8081"
       # Agent gets its own token from Keycloak directly (client_credentials)
-      ZITADEL_ISSUER: "http://keycloak:8080/realms/poc"
-      ZITADEL_AGENT_CLIENT_ID: "agent-service"
-      ZITADEL_AGENT_CLIENT_SECRET: "agent-service-secret"
+      KC_ISSUER: "http://keycloak:8080/realms/poc"
+      AGENT_CLIENT_ID: "agent-service"
+      AGENT_CLIENT_SECRET: "agent-service-secret"
       OBO_SCOPE: "openid profile email offline_access"
       REDIS_URL: "redis://redis:6379"
-      AGENT_MODEL: "${AGENT_MODEL:-gpt-4o-mini}"
+      # Default: local llama.cpp via litellm alias qwen-local (see config/litellm.yaml)
+      AGENT_MODEL: "${AGENT_MODEL:-qwen-local}"
+      LLM_TIMEOUT_SECONDS: "${LLM_TIMEOUT_SECONDS:-120}"
       ENABLE_HITL: "0"
       AGENT_STATE_AEAD_KEY: "${AGENT_STATE_AEAD_KEY:-YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=}"
     healthcheck:
@@ -164,8 +182,11 @@ services:
 
   # ── Webapp ─────────────────────────────────────────────────────────────
   webapp:
-    build: ./services/webapp
+    build:
+      context: ./services
+      dockerfile: webapp/Dockerfile
     container_name: poc-webapp
+    restart: unless-stopped
     networks: [poc-net]
     ports: ["8080:8080"]
     depends_on:
@@ -180,3 +201,39 @@ services:
       PUBLIC_KC_URL: "http://localhost:8180/realms/poc"
       PUBLIC_AGENT_URL: "http://localhost:8082"
       PUBLIC_OBO_URL: "http://localhost:8081"
+
+  # ── Observability ──────────────────────────────────────────────────────
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    container_name: poc-redis-exporter
+    networks: [poc-net]
+    environment:
+      REDIS_ADDR: "redis://redis:6379"
+    depends_on:
+      redis: {condition: service_healthy}
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: poc-prometheus
+    networks: [poc-net]
+    ports: ["9090:9090"]
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=2d"
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: poc-grafana
+    networks: [poc-net]
+    ports: ["3000:3000"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus

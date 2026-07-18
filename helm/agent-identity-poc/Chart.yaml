@@ -1,0 +1,12 @@
+apiVersion: v2
+name: agent-identity-poc
+description: >-
+  RFC 8693 On-Behalf-Of delegation for AI agents — obo-exchange broker, agent,
+  MCP mock, webapp visualizer and LiteLLM proxy. Every component is optional
+  and externally wireable: point the chart at an existing Keycloak, Redis or
+  MCP server instead of deploying the bundled ones.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords: [oauth, rfc8693, token-exchange, ai-agents, keycloak]
+home: https://github.com/lorenzogirardi/on-behalf-of-RFC_8693

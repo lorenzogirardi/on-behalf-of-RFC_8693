@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: poc-config
+  labels:
+    {{- include "poc.labels" . | nindent 4 }}
+data:
+  KC_ISSUER: {{ .Values.config.kcIssuer | quote }}
+  EXCHANGE_APP_CLIENT_ID: {{ .Values.config.exchangeAppClientId | quote }}
+  AGENT_CLIENT_ID: {{ .Values.config.agentClientId | quote }}
+  DEFAULT_SCOPE: {{ .Values.config.defaultScope | quote }}
+  OBO_SCOPE: {{ .Values.config.oboScope | quote }}
+  REDIS_URL: {{ .Values.config.redisUrl | quote }}
+  AGENT_MODEL: {{ .Values.config.agentModel | quote }}
+  ALLOW_LOCAL_FALLBACK: {{ .Values.config.allowLocalFallback | quote }}
+  IDENTITY_EVENTS: {{ .Values.config.identityEvents | quote }}
+  ENABLE_HITL: {{ .Values.config.enableHitl | quote }}

@@ -107,13 +107,17 @@ class OBOClient:
 
     @classmethod
     def from_env(cls) -> "OBOClient":
-        kc_issuer = os.getenv("ZITADEL_ISSUER", "http://keycloak:8080/realms/poc")
+        # Canonical names first; legacy ZITADEL_* names kept as fallbacks.
+        kc_issuer = (os.getenv("KC_ISSUER") or os.getenv("ZITADEL_ISSUER")
+                     or "http://keycloak:8080/realms/poc")
         kc_token_url = os.getenv("KC_TOKEN_URL",
                                  kc_issuer.rstrip("/") + "/protocol/openid-connect/token")
         return cls(
             kc_token_url=kc_token_url,
             obo_exchange_base=os.getenv("OBO_EXCHANGE_BASE", "http://obo-exchange:8081"),
-            agent_client_id=os.getenv("ZITADEL_AGENT_CLIENT_ID", "agent-service"),
-            agent_client_secret=os.getenv("ZITADEL_AGENT_CLIENT_SECRET", "agent-service-secret"),
+            agent_client_id=(os.getenv("AGENT_CLIENT_ID")
+                             or os.getenv("ZITADEL_AGENT_CLIENT_ID") or "agent-service"),
+            agent_client_secret=(os.getenv("AGENT_CLIENT_SECRET")
+                                 or os.getenv("ZITADEL_AGENT_CLIENT_SECRET") or "agent-service-secret"),
             scope=os.getenv("OBO_SCOPE", "openid profile email offline_access"),
         )

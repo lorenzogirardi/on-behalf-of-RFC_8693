@@ -1,0 +1,20 @@
+# Self-contained in-cluster demo: bundled Keycloak + Redis, single replicas,
+# HMAC fallback allowed (demo ergonomics — webapp shows the ⚠ badge).
+#   helm install poc ./helm/agent-identity-poc -f helm/agent-identity-poc/values-dev.yaml
+
+config:
+  allowLocalFallback: "true"
+
+keycloak:
+  enabled: true
+
+redis:
+  enabled: true
+
+services:
+  obo-exchange:
+    replicas: 1
+    autoscaling: {enabled: false}
+  agent:
+    replicas: 1
+    autoscaling: {enabled: false}

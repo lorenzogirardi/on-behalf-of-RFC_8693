@@ -71,14 +71,23 @@ class GrantStore:
         self.save(instance_id, refreshed)
         return refreshed.access_token
 
+    def ping(self) -> bool:
+        """True if the backing Redis answers (False on in-memory fallback)."""
+        if not self._redis:
+            return False
+        try:
+            return bool(self._redis.ping())
+        except Exception:
+            return False
+
     def append_trace(self, instance_id: str, entry: dict) -> None:
+        # Redis list: RPUSH is atomic, so concurrent tool calls (or multiple
+        # agent replicas) never lose entries the way GET+SET would.
         try:
             key = self._trace_prefix + instance_id
             if self._redis:
-                existing = self._redis.get(key)
-                items = json.loads(existing) if existing else []
-                items.append(entry)
-                self._redis.set(key, json.dumps(items), ex=86400)
+                self._redis.rpush(key, json.dumps(entry))
+                self._redis.expire(key, 86400)
             else:
                 items = self._mem.get(key, [])
                 items = list(items) + [entry]
@@ -90,8 +99,7 @@ class GrantStore:
         try:
             key = self._trace_prefix + instance_id
             if self._redis:
-                data = self._redis.get(key)
-                return json.loads(data) if data else []
+                return [json.loads(x) for x in self._redis.lrange(key, 0, -1)]
             return list(self._mem.get(key, []))
         except Exception:
             return []
