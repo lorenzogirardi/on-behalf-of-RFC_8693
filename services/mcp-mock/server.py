@@ -152,9 +152,11 @@ async def mcp_endpoint(request: Request):
         return JSONResponse({"jsonrpc": "2.0", "id": id_, "result": {"tools": TOOLS}})
 
     if method == "tools/call":
-        params = body.get("params", {})
-        name = params.get("name", "")
-        arguments = params.get("arguments", {})
+        # `or {}`: JSON-RPC clients (LLM-driven) may send params/arguments as
+        # explicit null — .get() with a default does not cover that.
+        params = body.get("params") or {}
+        name = params.get("name") or ""
+        arguments = params.get("arguments") or {}
         result_text = _exec_tool(name, arguments)
         TOOL_CALLS.labels(name or "unknown").inc()
         log.info(f"[MCP] tools/call name={name} by sub={sub} act={act} → {result_text[:80]}")

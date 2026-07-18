@@ -184,12 +184,20 @@ async def _run_flow(request: Request) -> JSONResponse:
                           f"act={(obo_claims.get('act') or {}).get('sub')}"})
 
     # ── STEP 3: Agent execution ──────────────────────────────────────────
-    async with httpx.AsyncClient(timeout=float(os.getenv("AGENT_TIMEOUT_SECONDS", "600"))) as c:
-        agent_resp = await c.post(f"{AGENT_URL}/a2a/run",
-                                  json={"task": task},
-                                  headers={"Authorization": f"Bearer {obo_token}",
-                                           "X-OBO-Refresh-Token": obo_data.get("refresh_token", ""),
-                                           "X-OBO-Expires-In": str(obo_data.get("expires_in", 3600))})
+    try:
+        async with httpx.AsyncClient(timeout=float(os.getenv("AGENT_TIMEOUT_SECONDS", "600"))) as c:
+            agent_resp = await c.post(f"{AGENT_URL}/a2a/run",
+                                      json={"task": task},
+                                      headers={"Authorization": f"Bearer {obo_token}",
+                                               "X-OBO-Refresh-Token": obo_data.get("refresh_token", ""),
+                                               "X-OBO-Expires-In": str(obo_data.get("expires_in", 3600))})
+    except httpx.TimeoutException:
+        return JSONResponse({"error": "agent_timeout",
+                             "detail": "agent did not answer within AGENT_TIMEOUT_SECONDS "
+                                       "(slow LLM or concurrent runs?)"},
+                            status_code=504)
+    except httpx.HTTPError as e:
+        return JSONResponse({"error": "agent_unreachable", "detail": str(e)}, status_code=502)
     if agent_resp.status_code != 200:
         return JSONResponse({"error": "agent_failed", "detail": agent_resp.text[:300]}, status_code=500)
 
