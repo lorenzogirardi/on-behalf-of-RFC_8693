@@ -187,6 +187,8 @@ Flow* dashboard turns this into a red ratio stat.
 
 ![Grafana — service RED dashboard](docs/screenshots/grafana-service-red.png)
 
+![Prometheus — scrape targets](docs/screenshots/prometheus-targets.png)
+
 ### Kubernetes (Helm)
 
 `helm/agent-identity-poc` deploys the stack with every component optional and
