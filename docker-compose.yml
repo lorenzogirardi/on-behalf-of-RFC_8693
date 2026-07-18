@@ -1,0 +1,182 @@
+version: "3.9"
+
+# Agent Identity POC — self-contained local stack (Podman / Docker)
+# No external services, no VPN, no cloud accounts required.
+#
+# Ports on localhost:
+#   8080  webapp        — identity flow visualizer
+#   8081  obo-exchange  — RFC 8693 OBO broker
+#   8082  agent         — AI agent (/a2a/run + /admin/*)
+#   8083  mcp-mock      — MCP tool server
+#   4000  litellm       — OpenAI-compatible LLM proxy
+#   8180  keycloak      — real Identity Provider (admin: admin/admin)
+#   6379  redis         — grant store
+
+networks:
+  poc-net:
+    driver: bridge
+
+services:
+
+  # ── Identity Provider (Keycloak) ─────────────────────────────────────
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    container_name: poc-keycloak
+    networks: [poc-net]
+    ports: ["8180:8080"]
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_HTTPS: "false"
+      # Enable token exchange (preview feature in Keycloak 21-24)
+      KC_FEATURES: "token-exchange,admin-fine-grained-authz"
+    command: ["start-dev"]
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q '\"status\"' <&3 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # ── Keycloak realm setup (runs once, then exits) ──────────────────────
+  keycloak-setup:
+    image: python:3.12-slim
+    container_name: poc-keycloak-setup
+    networks: [poc-net]
+    depends_on:
+      keycloak: {condition: service_healthy}
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    volumes:
+      - ./services/keycloak-setup:/setup:ro
+    command: >
+      bash -c "
+        apt-get update -qq &&
+        apt-get install -y curl -qq --no-install-recommends &&
+        bash /setup/setup.sh
+      "
+    restart: "no"
+
+  # ── Redis ─────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: poc-redis
+    networks: [poc-net]
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── LiteLLM proxy ─────────────────────────────────────────────────────
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: poc-litellm
+    networks: [poc-net]
+    ports: ["4000:4000"]
+    volumes:
+      - ./config/litellm.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-sk-placeholder}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OLLAMA_API_BASE: "${OLLAMA_API_BASE:-http://host.containers.internal:11434}"
+    healthcheck:
+      test: ["CMD", "/usr/bin/python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # ── OBO Exchange ──────────────────────────────────────────────────────
+  obo-exchange:
+    build: ./services/obo-exchange
+    container_name: poc-obo-exchange
+    networks: [poc-net]
+    ports: ["8081:8081"]
+    depends_on:
+      keycloak: {condition: service_healthy}
+    environment:
+      PORT: "8081"
+      KC_ISSUER: "http://keycloak:8080/realms/poc"
+      KC_TOKEN_URL: "http://keycloak:8080/realms/poc/protocol/openid-connect/token"
+      EXCHANGE_APP_CLIENT_ID: "exchange-app"
+      EXCHANGE_APP_CLIENT_SECRET: "exchange-app-secret"
+      AGENT_CLIENT_ID: "agent-service"
+      AGENT_CLIENT_SECRET: "agent-service-secret"
+      DEFAULT_SCOPE: "openid profile email offline_access"
+      IDENTITY_EVENTS: "true"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── MCP Mock ──────────────────────────────────────────────────────────
+  mcp-mock:
+    build: ./services/mcp-mock
+    container_name: poc-mcp-mock
+    networks: [poc-net]
+    ports: ["8083:8083"]
+    environment:
+      PORT: "8083"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8083/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Agent ──────────────────────────────────────────────────────────────
+  agent:
+    build: ./services/agent
+    container_name: poc-agent
+    networks: [poc-net]
+    ports: ["8082:8082"]
+    depends_on:
+      redis:        {condition: service_healthy}
+      obo-exchange: {condition: service_healthy}
+      mcp-mock:     {condition: service_healthy}
+      litellm:      {condition: service_healthy}
+    environment:
+      APP_PORT: "8082"
+      LLM_BASE_URL: "http://litellm:4000/v1"
+      MCP_BASE_URL: "http://mcp-mock:8083"
+      OBO_EXCHANGE_BASE: "http://obo-exchange:8081"
+      # Agent gets its own token from Keycloak directly (client_credentials)
+      ZITADEL_ISSUER: "http://keycloak:8080/realms/poc"
+      ZITADEL_AGENT_CLIENT_ID: "agent-service"
+      ZITADEL_AGENT_CLIENT_SECRET: "agent-service-secret"
+      OBO_SCOPE: "openid profile email offline_access"
+      REDIS_URL: "redis://redis:6379"
+      AGENT_MODEL: "${AGENT_MODEL:-gpt-4o-mini}"
+      ENABLE_HITL: "0"
+      AGENT_STATE_AEAD_KEY: "${AGENT_STATE_AEAD_KEY:-YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=}"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8082/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  # ── Webapp ─────────────────────────────────────────────────────────────
+  webapp:
+    build: ./services/webapp
+    container_name: poc-webapp
+    networks: [poc-net]
+    ports: ["8080:8080"]
+    depends_on:
+      agent:        {condition: service_healthy}
+      obo-exchange: {condition: service_healthy}
+    environment:
+      PORT: "8080"
+      AGENT_URL: "http://agent:8082"
+      OBO_URL: "http://obo-exchange:8081"
+      KC_ISSUER: "http://keycloak:8080/realms/poc"
+      # Public URLs the browser uses (localhost)
+      PUBLIC_KC_URL: "http://localhost:8180/realms/poc"
+      PUBLIC_AGENT_URL: "http://localhost:8082"
+      PUBLIC_OBO_URL: "http://localhost:8081"

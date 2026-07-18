@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Identity Flow</title>
+<style>
+  :root {
+    --bg:#0f1117;--surface:#1a1d27;--surface2:#252836;--border:#2e3149;
+    --text:#e2e4f0;--muted:#7b7f9e;
+    --blue:#4f8ef7;--green:#3dd68c;--orange:#f7934f;
+    --purple:#b57ef7;--red:#f76f6f;--yellow:#f7d94f;--cyan:#4fd7f7;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono','Fira Code',monospace;font-size:13px;}
+  header{padding:16px 28px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:16px;}
+  header h1{font-size:17px;font-weight:700;color:var(--blue);}
+  header .sub{color:var(--muted);font-size:11px;margin-top:2px;}
+  .kc-link{margin-left:auto;font-size:11px;color:var(--muted);}
+  .kc-link a{color:var(--cyan);text-decoration:none;}
+  .layout{display:grid;grid-template-columns:340px 1fr;height:calc(100vh - 57px);}
+  .sidebar{border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden;}
+  .sb-section{padding:14px 16px;border-bottom:1px solid var(--border);}
+  .sb-section h3{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:10px;}
+  label{display:block;margin-bottom:4px;color:var(--muted);font-size:11px;}
+  input,textarea,select{width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);
+    padding:7px 9px;border-radius:6px;font-family:inherit;font-size:12px;outline:none;transition:border .15s;}
+  input:focus,textarea:focus{border-color:var(--blue);}
+  textarea{resize:vertical;min-height:72px;}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px;}
+  .btn{width:100%;padding:9px;background:var(--blue);color:#fff;border:none;border-radius:6px;
+    font-family:inherit;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s;}
+  .btn:hover{opacity:.85;} .btn:disabled{opacity:.4;cursor:not-allowed;}
+  .btn-ghost{background:var(--surface2);color:var(--text);font-size:11px;padding:5px 8px;}
+  .main{overflow-y:auto;padding:22px 28px;}
+  /* Steps */
+  .steps{display:flex;flex-direction:column;gap:0;}
+  .step{position:relative;padding-left:40px;padding-bottom:20px;}
+  .step:last-child{padding-bottom:0;}
+  .step::before{content:'';position:absolute;left:13px;top:28px;bottom:0;width:2px;background:var(--border);}
+  .step:last-child::before{display:none;}
+  .dot{position:absolute;left:6px;top:6px;width:15px;height:15px;border-radius:50%;
+    border:2px solid var(--border);background:var(--bg);}
+  .dot.done{border-color:var(--green);background:var(--green);}
+  .dot.warn{border-color:var(--yellow);background:var(--yellow);}
+  .dot.run{border-color:var(--blue);animation:pulse 1s infinite;}
+  @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(79,142,247,.4)}50%{box-shadow:0 0 0 6px rgba(79,142,247,0)}}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;}
+  .card-head{padding:10px 14px;display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;}
+  .card-head:hover{background:var(--surface2);}
+  .step-n{font-size:10px;color:var(--muted);min-width:18px;}
+  .step-name{font-weight:600;font-size:13px;flex:1;}
+  .badge{font-size:10px;padding:2px 8px;border-radius:20px;font-weight:600;}
+  .b-ok{background:rgba(61,214,140,.15);color:var(--green);}
+  .b-warn{background:rgba(247,217,79,.15);color:var(--yellow);}
+  .b-run{background:rgba(79,142,247,.15);color:var(--blue);}
+  .b-pend{background:var(--surface2);color:var(--muted);}
+  .card-body{padding:0 14px 14px;display:none;}
+  .card-body.open{display:block;}
+  .note{font-size:11px;color:var(--muted);margin-bottom:10px;line-height:1.6;}
+  /* Token */
+  .tok-box{margin-top:10px;}
+  .tok-box h4{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px;}
+  .tok-raw{font-size:10px;word-break:break-all;margin-bottom:8px;}
+  .jwt-h{color:var(--red);} .jwt-p{color:var(--purple);} .jwt-s{color:var(--blue);} .jwt-d{color:var(--muted);}
+  .claims{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-top:6px;}
+  .claim{background:var(--surface2);border-radius:5px;padding:5px 9px;}
+  .ck{font-size:10px;color:var(--muted);margin-bottom:1px;}
+  .cv{font-size:11px;word-break:break-all;}
+  .cv.hi{color:var(--green);} .cv.act{color:var(--orange);} .cv.iss{color:var(--cyan);}
+  /* Transport diagram */
+  .diag{margin:10px 0;padding:12px 14px;background:var(--surface2);border-radius:7px;border:1px solid var(--border);}
+  .diag code{font-size:11px;line-height:1.9;white-space:pre;display:block;}
+  .t-u{color:var(--blue);} .t-a{color:var(--orange);} .t-o{color:var(--green);} .t-m{color:var(--muted);}
+  /* Trace */
+  .trace{display:flex;flex-direction:column;gap:5px;margin-top:8px;}
+  .thop{background:var(--surface2);border-radius:6px;padding:7px 11px;border-left:3px solid var(--green);}
+  .thop.fail{border-left-color:var(--red);}
+  .thop-meta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:3px;}
+  .tm{color:var(--purple);font-size:11px;font-weight:600;}
+  .tt{color:var(--yellow);font-size:11px;}
+  .tw{font-size:11px;} .tw .su{color:var(--blue);} .tw .ac{color:var(--orange);}
+  /* Result */
+  .result{margin-top:10px;background:var(--surface2);border-radius:7px;padding:12px;border:1px solid var(--border);}
+  .result pre{white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.6;color:var(--green);}
+  /* Fallback warning */
+  .fallback-warn{background:rgba(247,217,79,.08);border:1px solid rgba(247,217,79,.3);
+    border-radius:6px;padding:8px 12px;margin-top:8px;font-size:11px;color:var(--yellow);line-height:1.6;}
+  /* Event stream */
+  .evstream{flex:1;overflow-y:auto;padding:10px 14px;border-top:1px solid var(--border);}
+  .evstream h3{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:6px;}
+  .evitem{padding:4px 0;border-bottom:1px solid var(--border);}
+  .evitem:last-child{border:none;}
+  .ev-ts{color:var(--muted);font-size:10px;}
+  .ev-stage{font-size:11px;font-weight:600;}
+  .s-login{color:var(--blue);} .s-exchange{color:var(--green);} .s-agent{color:var(--orange);} .s-audit{color:var(--purple);}
+  .ev-note{color:var(--muted);font-size:10px;}
+  .spinner{display:inline-block;width:11px;height:11px;border:2px solid var(--border);
+    border-top-color:var(--blue);border-radius:50%;animation:spin .7s linear infinite;margin-right:5px;}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .empty{text-align:center;padding:50px 20px;color:var(--muted);}
+  .empty .ico{font-size:36px;margin-bottom:10px;}
+  .flow-title{font-size:15px;font-weight:700;margin-bottom:18px;}
+  .qt{display:flex;flex-direction:column;gap:5px;margin-top:4px;}
+  .qt button{background:var(--surface2);color:var(--text);font-size:11px;padding:5px 8px;text-align:left;border-radius:5px;border:1px solid var(--border);}
+  .qt button:hover{border-color:var(--blue);}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Agent Identity Flow</h1>
+    <div class="sub">RFC 8693 On-Behalf-Of · Keycloak · MCP tools</div>
+  </div>
+  <div class="kc-link">
+    Keycloak: <a href="http://localhost:8180/admin" target="_blank">localhost:8180</a>
+    &nbsp;·&nbsp; realm: <strong>poc</strong>
+  </div>
+</header>
+
+<div class="layout">
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sb-section">
+      <h3>User Credentials</h3>
+      <div class="row">
+        <div>
+          <label>Username</label>
+          <input id="username" value="alice" placeholder="alice / bob" />
+        </div>
+        <div>
+          <label>Password</label>
+          <input id="password" type="password" value="alice123" />
+        </div>
+      </div>
+      <label>Task</label>
+      <textarea id="task">List the MCP tools you have, then call the echo tool with message "hello from agent identity poc".</textarea>
+      <br>
+      <button class="btn" id="runBtn" onclick="runFlow()">▶ Run Agent</button>
+    </div>
+    <div class="sb-section">
+      <h3>Quick Tasks</h3>
+      <div class="qt">
+        <button onclick="setTask('List the MCP tools available.')">List MCP tools</button>
+        <button onclick="setTask('List Kubernetes deployments in the default namespace.')">List K8s deployments</button>
+        <button onclick="setTask('Check the health of the mcp-mock service.')">Check service health</button>
+        <button onclick="setTask('List open PR reviews for the platform repo.')">List PR reviews</button>
+      </div>
+    </div>
+    <div class="evstream" id="evstream">
+      <h3>Live Events</h3>
+      <div id="evlist"><div class="empty" style="padding:20px 0"><div class="ico">📡</div><div style="font-size:11px">Events appear here as the flow runs.</div></div></div>
+    </div>
+  </div>
+
+  <!-- Main -->
+  <div class="main" id="main">
+    <div class="empty">
+      <div class="ico">🔐</div>
+      <p>Submit a task to visualize the full identity delegation chain.<br><br>
+      <span style="font-size:11px;color:var(--muted)">
+        Users: <span style="color:var(--blue)">alice</span> / alice123 &nbsp;·&nbsp;
+               <span style="color:var(--blue)">bob</span> / bob123<br>
+        Keycloak is running at <a href="http://localhost:8180" target="_blank" style="color:var(--cyan)">localhost:8180</a>
+      </span>
+      </p>
+    </div>
+  </div>
+</div>
+
+<script>
+function setTask(t){ document.getElementById('task').value=t; }
+function ft(ts){ return new Date(ts*1000).toLocaleTimeString('en-GB',{hour12:false}); }
+function sc(s){ if(s.includes('login')) return 's-login'; if(s.includes('exchange')) return 's-exchange'; if(s.includes('agent')) return 's-agent'; return 's-audit'; }
+
+function renderEvents(evs){
+  const el=document.getElementById('evlist');
+  if(!evs||!evs.length) return;
+  el.innerHTML=evs.slice(-30).reverse().map(e=>`
+    <div class="evitem">
+      <span class="ev-ts">${ft(e.ts)}</span> <span class="ev-stage ${sc(e.stage)}">${e.stage}</span>
+      <div class="ev-note">${e.note||''}</div>
+    </div>`).join('');
+}
+
+function renderTokParts(p){
+  if(!p||!p.raw_truncated) return '';
+  const [h,pay,s]=p.raw_truncated.split('.');
+  return `<div class="tok-raw"><span class="jwt-h">${h||''}</span><span class="jwt-d">.</span><span class="jwt-p">${pay||''}</span><span class="jwt-d">.</span><span class="jwt-s">${s?s.substring(0,16)+'…':''}</span></div>`;
+}
+
+function renderClaims(c){
+  if(!c) return '';
+  const rows=[];
+  if(c.sub)  rows.push(['sub', c.sub,'hi']);
+  if(c.act)  rows.push(['act.sub',(c.act.sub||JSON.stringify(c.act)),'act']);
+  if(c.email)rows.push(['email',c.email,'']);
+  if(c.iss)  rows.push(['iss',c.iss,'iss']);
+  if(c.exp)  rows.push(['exp',ft(c.exp),'']);
+  if(c.scope)rows.push(['scope',c.scope,'']);
+  return `<div class="claims">${rows.map(([k,v,cl])=>`<div class="claim"><div class="ck">${k}</div><div class="cv ${cl}">${v}</div></div>`).join('')}</div>`;
+}
+
+function renderDiagram(s){
+  if(s.step!==2||!s.obo_claims) return '';
+  const sub=s.obo_claims.sub||'?';
+  const act=(s.obo_claims.act||{}).sub||'?';
+  return `<div class="diag"><code><span class="t-u">User JWT</span>  {sub: <span class="t-u">${sub}</span>}
+  <span class="t-m">│  user's raw credential — gateway intercepts</span>
+  <span class="t-m">↓  obo-exchange → Keycloak RFC 8693 token exchange</span>
+<span class="t-o">OBO Token</span>  {sub: <span class="t-u">${sub}</span>, act: {sub: <span class="t-a">${act}</span>}}
+  <span class="t-m">│  delegated token — injected by gateway</span>
+  <span class="t-m">↓  agent receives ONLY this</span>
+Agent sees: acting as <span class="t-u">${sub}</span> via <span class="t-a">${act}</span></code></div>`;
+}
+
+function renderTrace(trace){
+  if(!trace||!trace.length) return '<div style="color:var(--muted);font-size:11px;margin-top:6px">No MCP calls traced yet.</div>';
+  return `<div class="trace">${trace.map(t=>`
+    <div class="thop ${t.ok===false?'fail':''}">
+      <div class="thop-meta">
+        <span class="tm">${t.method||'?'}</span>
+        ${t.tool?`<span class="tt">${t.tool}</span>`:''}
+        <span style="color:${t.ok!==false?'var(--green)':'var(--red)'};font-size:11px">${t.ok!==false?'✓':'✗'}</span>
+        <span style="color:var(--muted);font-size:10px">${ft(t.ts||0)}</span>
+      </div>
+      <div class="tw"><span class="su">sub=${t.presented_identity?.sub||'?'}</span><span style="color:var(--muted)"> via </span><span class="ac">act=${t.presented_identity?.act_sub||'?'}</span></div>
+      ${t.error?`<div style="color:var(--red);font-size:10px">${t.error}</div>`:''}
+    </div>`).join('')}</div>`;
+}
+
+function renderSteps(steps, result){
+  return `<div class="flow-title">Identity Delegation Chain</div><div class="steps">${
+    steps.map((s,i)=>{
+      const warn = s.is_fallback;
+      const dotCls = warn?'warn':'done';
+      const badgeCls = warn?'b-warn':'b-ok';
+      const badgeTxt = warn?'⚠ fallback':'✓ done';
+      return `<div class="step">
+        <div class="dot ${dotCls}"></div>
+        <div class="card">
+          <div class="card-head" onclick="toggle(this)">
+            <span class="step-n">0${s.step}</span>
+            <span class="step-name">${s.name}</span>
+            <span class="badge ${badgeCls}">${badgeTxt}</span>
+            <span style="color:var(--muted);font-size:10px;margin-left:4px">${i<2?'▼':'▶'}</span>
+          </div>
+          <div class="card-body ${i<2?'open':''}">
+            ${s.note?`<div class="note">${s.note}</div>`:''}
+            ${s.is_fallback?`<div class="fallback-warn">⚠ Keycloak token-exchange feature not enabled on this Keycloak version/config. Using local HMAC-signed OBO token. The token structure is identical; only the signature authority differs. In production this would be a Keycloak-issued RS256 JWT.</div>`:''}
+            ${renderDiagram(s)}
+            ${s.token_preview?`<div class="tok-box"><h4>JWT Token</h4>${renderTokParts(s.token_preview)}${renderClaims(s.obo_claims||s.claims||null)}</div>`:''}
+            ${s.identity&&s.identity.obo_grant?`<div class="tok-box"><h4>Identity audit</h4><div class="claim" style="margin-bottom:5px"><div class="cv hi">${s.identity.obo_grant.means}</div></div></div>`:''}
+            ${s.trace!==undefined?`<div class="tok-box"><h4>MCP call trace — ${s.trace.length} hop${s.trace.length!==1?'s':''}</h4>${renderTrace(s.trace)}</div>`:''}
+            ${s.step===3&&result?`<div class="tok-box"><h4>Agent result</h4><div class="result"><pre>${result}</pre></div></div>`:''}
+          </div>
+        </div>
+      </div>`;
+    }).join('')
+  }</div>`;
+}
+
+function toggle(el){
+  const b=el.nextElementSibling;
+  b.classList.toggle('open');
+  const arr=el.querySelector('span:last-child');
+  arr.textContent=b.classList.contains('open')?'▼':'▶';
+}
+
+async function runFlow(){
+  const btn=document.getElementById('runBtn');
+  const task=document.getElementById('task').value.trim();
+  const username=document.getElementById('username').value.trim();
+  const password=document.getElementById('password').value.trim();
+  if(!task) return;
+
+  btn.disabled=true;
+  btn.innerHTML='<span class="spinner"></span>Running…';
+  document.getElementById('main').innerHTML=`<div class="flow-title">Identity Delegation Chain</div><div class="steps">${
+    ['User Login (Keycloak)','OBO Token Exchange','Agent Execution','Audit Trail'].map((n,i)=>`
+    <div class="step">
+      <div class="dot ${i===0?'run':''}"></div>
+      <div class="card"><div class="card-head">
+        <span class="step-n">0${i+1}</span>
+        <span class="step-name">${n}</span>
+        <span class="badge ${i===0?'b-run':'b-pend'}">${i===0?'⟳ running':'◌ pending'}</span>
+      </div></div>
+    </div>`).join('')
+  }</div>`;
+
+  try{
+    const resp=await fetch('/run',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({task,username,password})
+    });
+    const data=await resp.json();
+    if(data.error){
+      document.getElementById('main').innerHTML=`<div style="padding:40px;color:var(--red)">Error: ${data.error}<br><small>${data.detail||''}</small></div>`;
+    } else {
+      document.getElementById('main').innerHTML=renderSteps(data.steps,data.result);
+      renderEvents(data.recent_events||[]);
+    }
+  }catch(e){
+    document.getElementById('main').innerHTML=`<div style="padding:40px;color:var(--red)">Network error: ${e.message}</div>`;
+  } finally {
+    btn.disabled=false;
+    btn.innerHTML='▶ Run Agent';
+  }
+}
+
+document.addEventListener('DOMContentLoaded',()=>{
+  document.getElementById('task').addEventListener('keydown',e=>{if(e.ctrlKey&&e.key==='Enter') runFlow();});
+});
+</script>
+</body>
+</html>

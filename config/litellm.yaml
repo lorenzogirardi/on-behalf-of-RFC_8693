@@ -1,0 +1,20 @@
+model_list:
+  - model_name: ollama/gemma4-12b-qat
+    litellm_params:
+      model: ollama_chat/gemma4-12b-qat
+      api_base: os.environ/OLLAMA_API_BASE
+      # gemma4 is a thinking model — disable thinking so content field is populated
+      extra_body:
+        options:
+          think: false
+
+  - model_name: gemma4-12b-qat
+    litellm_params:
+      model: ollama_chat/gemma4-12b-qat
+      api_base: os.environ/OLLAMA_API_BASE
+      extra_body:
+        options:
+          think: false
+
+litellm_settings:
+  drop_params: true

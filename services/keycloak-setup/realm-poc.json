@@ -1,0 +1,119 @@
+{
+  "realm": "poc",
+  "enabled": true,
+  "displayName": "Agent Identity POC",
+  "accessTokenLifespan": 3600,
+  "refreshTokenMaxReuse": 0,
+  "revokeRefreshToken": true,
+
+  "clients": [
+    {
+      "clientId": "agent-service",
+      "name": "AI Agent (machine service account)",
+      "description": "Service account for the AI agent — used as actor in OBO token exchange",
+      "enabled": true,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "agent-service-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "publicClient": false,
+      "attributes": {
+        "access.token.lifespan": "3600"
+      }
+    },
+    {
+      "clientId": "exchange-app",
+      "name": "OBO Exchange App (holds skeleton key)",
+      "description": "Confidential client used by obo-exchange to run RFC 8693 token exchange. Never exposed to agent or user.",
+      "enabled": true,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "exchange-app-secret",
+      "serviceAccountsEnabled": false,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "publicClient": false,
+      "attributes": {
+        "standard.token.exchange": "true",
+        "access.token.lifespan": "3600"
+      },
+      "protocolMappers": [
+        {
+          "name": "act-claim-mapper",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "act",
+            "claim.value": "{\"sub\":\"agent-service\"}",
+            "jsonType.label": "JSON",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "poc-webapp",
+      "name": "POC Web UI (user login)",
+      "description": "Public PKCE client for the demo webapp — users log in here",
+      "enabled": true,
+      "clientAuthenticatorType": "client-secret",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "redirectUris": [
+        "http://localhost:8080/*",
+        "http://webapp:8080/*"
+      ],
+      "webOrigins": ["http://localhost:8080", "http://webapp:8080"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "name": "exchange-app-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "exchange-app",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+
+  "users": [
+    {
+      "username": "alice",
+      "email": "alice@poc.local",
+      "firstName": "Alice",
+      "lastName": "Operator",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [{"type": "password", "value": "alice123", "temporary": false}],
+      "realmRoles": ["user"]
+    },
+    {
+      "username": "bob",
+      "email": "bob@poc.local",
+      "firstName": "Bob",
+      "lastName": "Engineer",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [{"type": "password", "value": "bob123", "temporary": false}],
+      "realmRoles": ["user"]
+    }
+  ],
+
+  "roles": {
+    "realm": [
+      {"name": "user", "description": "Standard platform user"},
+      {"name": "platform-admin", "description": "Can approve HITL gates"}
+    ]
+  }
+}
