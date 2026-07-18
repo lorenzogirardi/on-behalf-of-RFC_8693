@@ -212,7 +212,13 @@ async def exchange(request: Request):
 
     scope = form.get("scope", DEFAULT_SCOPE)
 
-    # Keycloak RFC 8693 token exchange
+    # Keycloak RFC 8693 token exchange.
+    # requested_token_type=refresh_token → Keycloak returns access_token AND
+    # refresh_token, which makes the grant renewable without the user present
+    # (with access_token type alone Keycloak omits the refresh_token).
+    requested_type = ("urn:ietf:params:oauth:token-type:refresh_token"
+                      if "offline_access" in scope.split()
+                      else "urn:ietf:params:oauth:token-type:access_token")
     kc_form = {
         "grant_type":           "urn:ietf:params:oauth:grant-type:token-exchange",
         "client_id":            EXCHANGE_CLIENT_ID,
@@ -221,7 +227,7 @@ async def exchange(request: Request):
         "subject_token_type":   "urn:ietf:params:oauth:token-type:access_token",
         "actor_token":          actor_token,
         "actor_token_type":     "urn:ietf:params:oauth:token-type:access_token",
-        "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "requested_token_type": requested_type,
         "scope":                scope,
     }
     if form.get("audience"):
@@ -325,8 +331,11 @@ async def authz(request: Request):
     if not user_token:
         return JSONResponse({"error": "missing bearer"}, status_code=401)
 
-    # Inline exchange
+    # Inline exchange (refresh_token type → renewable grant, see /exchange)
     actor_token = await _get_actor_token()
+    requested_type = ("urn:ietf:params:oauth:token-type:refresh_token"
+                      if "offline_access" in DEFAULT_SCOPE.split()
+                      else "urn:ietf:params:oauth:token-type:access_token")
     kc_form = {
         "grant_type":           "urn:ietf:params:oauth:grant-type:token-exchange",
         "client_id":            EXCHANGE_CLIENT_ID,
@@ -335,7 +344,7 @@ async def authz(request: Request):
         "subject_token_type":   "urn:ietf:params:oauth:token-type:access_token",
         "actor_token":          actor_token,
         "actor_token_type":     "urn:ietf:params:oauth:token-type:access_token",
-        "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "requested_token_type": requested_type,
         "scope":                DEFAULT_SCOPE,
     }
     t0 = time.perf_counter()

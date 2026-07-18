@@ -167,11 +167,19 @@ print(json.loads(base64.urlsafe_b64decode(p))['sub'])
   fi
 
   if [ -n "$USER_TOKEN" ]; then
-    echo "  [2.3] OBO exchange — Keycloak or fallback"
+    echo "  [2.3] OBO exchange — real RFC 8693 (no Authorization header:"
+    echo "        obo-exchange must use its own agent-service actor token)"
+    # Subject token via webapp /login: dev-mode Keycloak derives the token iss
+    # from the request Host header, and the exchange (made in-network against
+    # keycloak:8080) rejects tokens issued through localhost:8180 with
+    # invalid_token. The webapp logs in through the internal hostname.
+    EX_TOKEN=$(curl -sf -X POST http://localhost:8080/login \
+      -H "Content-Type: application/json" \
+      -d '{"username":"alice","password":"alice123"}' \
+      | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])" 2>/dev/null || echo "$USER_TOKEN")
     OBO_RESP=$(curl -sf -X POST http://localhost:8081/exchange \
-      -H "Authorization: Bearer $USER_TOKEN" \
       -H "Content-Type: application/x-www-form-urlencoded" \
-      -d "subject_token=$USER_TOKEN&scope=openid+profile+email+offline_access")
+      -d "subject_token=$EX_TOKEN&scope=openid+profile+email+offline_access")
     OBO_OK=$(echo "$OBO_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print('ok' if 'access_token' in d else 'fail')" 2>/dev/null || echo "fail")
     IS_FALLBACK=$(echo "$OBO_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if d.get('_note','').startswith('local-fallback') else 'no')" 2>/dev/null || echo "no")
     if [ "$OBO_OK" = "ok" ]; then
@@ -184,7 +192,7 @@ d=json.loads(base64.urlsafe_b64decode(p))
 print('sub=%s act=%s fallback=%s' % (d.get('sub'),str(d.get('act',{}).get('sub')),d.get('_fallback',False)))
 ")
       if [ "$IS_FALLBACK" = "yes" ]; then
-        ok "OBO exchange OK (local fallback — Keycloak token-exchange not configured): $OBO_SUB"
+        fail "OBO exchange degraded to local fallback (run ./scripts/fix-keycloak-token-exchange.sh): $OBO_SUB"
       else
         ok "OBO exchange OK (Keycloak RFC 8693): $OBO_SUB"
       fi
