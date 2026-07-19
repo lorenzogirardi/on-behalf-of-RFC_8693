@@ -132,6 +132,135 @@ curl http://localhost:8082/admin/instances/$RUN_ID/trace    | python3 -m json.to
 ./scripts/stop.sh
 ```
 
+## Inside the JWT — fields, exchange mechanics, and permissions
+
+### Anatomy
+
+A JWT is three base64url segments — `header.payload.signature`:
+
+```
+eyJhbGciOiJSUzI1NiIsImtpZCI6Im...  .  eyJzdWIiOiI4YzhhZjUzYy...  .  hK3Xz9fQ...
+        header                              payload                  signature
+   {alg: RS256, kid: ...}         {sub, act, iss, exp, ...}    RSA over header.payload
+```
+
+It is **stateless**: any service can read the claims and verify the signature
+against Keycloak's public keys (`/realms/poc/protocol/openid-connect/certs`,
+selected by `kid`) without calling Keycloak. What it is *not*: encrypted —
+anyone holding the token reads every claim. Never put secrets in claims.
+
+### The fields, and who consumes them
+
+| Claim | Example (this POC) | Who uses it, and for what |
+|---|---|---|
+| `iss` | `http://keycloak:8080/realms/poc` | Every verifier: token must come from *this* realm. Keycloak itself rejects a subject token whose `iss` doesn't match (see the dev-mode Host-header gotcha in `docs/CRITICAL_REVIEW.md §4b`) |
+| `sub` | `db5aea47-...` (alice's UUID) | **The human owner of the action.** Survives the exchange untouched — this is the whole point. Downstream policy, audit, rate limits key on it |
+| `act.sub` | `agent-service` | **Who is executing.** Added by RFC 8693 during the exchange. Lets a tool server distinguish "alice herself" from "an agent acting for alice" |
+| `aud` | `exchange-app` | Gatekeeper of the exchange: Keycloak accepts a subject token only if its audience includes the exchanging client. The audience mapper on `poc-webapp` is what puts it there (setup step 4) |
+| `azp` | `poc-webapp` | Authorized party — which *client* obtained the token. Used to derive a readable `act.sub` (the actor token's `sub` is a UUID; its `azp` is the client name) |
+| `exp` / `iat` | unix timestamps | Lifetime. The agent refreshes when `now >= exp - 60s` (`near_expiry`), so long tasks survive token expiry without the human present |
+| `jti` | random UUID | Unique token id — revocation lists and replay detection key on it |
+| `scope` | `openid profile email offline_access` | Capability envelope. `offline_access` is what makes obo-exchange request a refresh token. Custom scopes (`mcp:read`, `mcp:write`) are the third enforcement layer |
+| `email`, `preferred_username` | `alice@poc.local` | Display/audit convenience, injected by protocol mappers |
+| `realm_access.roles` | `["platform-admin", ...]` | **The authorization payload.** Filled from Keycloak roles — which can be fed by AD groups (below). Tool servers read this to allow/deny |
+
+### How the fields drive the exchange
+
+```
+user JWT {sub=alice, aud=exchange-app, azp=poc-webapp}          ← subject_token
+agent JWT {sub=<uuid>, azp=agent-service}                        ← actor_token
+        │
+        ▼  POST /token  grant_type=urn:ietf:params:oauth:grant-type:token-exchange
+Keycloak checks:
+  1. subject_token signature + exp + iss valid
+  2. aud contains "exchange-app"  → the exchanging client may consume it
+  3. actor client has the token-exchange permission on exchange-app
+        │
+        ▼
+OBO JWT {sub=alice, act={sub: agent-service}, scope=..., exp=+1h}
+  + refresh_token   (because requested_token_type=refresh_token when
+                     scope includes offline_access — Keycloak omits the
+                     RT otherwise)
+```
+
+Every downstream hop receives the OBO token and can answer the two questions
+separately: *whose* action is this (`sub`) and *what* is executing it (`act`).
+On refresh, `act` is preserved and the refresh token rotates.
+
+### From AD group to tool permission
+
+The chain that turns "alice is in an Active Directory group" into "this MCP
+tool call is allowed":
+
+```
+AD group  ──(1)──▶  Keycloak group/role  ──(2)──▶  claim in JWT  ──(3)──▶  enforcement
+CN=Platform-Admins   realm role:              realm_access.roles:      tool server / gateway
+                     platform-admin           ["platform-admin"]       checks the claim
+```
+
+**(1) AD → Keycloak.** Two standard options, zero application code:
+- *User federation → LDAP*: Keycloak connects to AD, imports users, and a
+  **group-ldap-mapper** syncs AD groups to Keycloak groups.
+- *Identity brokering*: users log in via ADFS/Entra ID (SAML/OIDC) and an
+  attribute/claim mapper translates the incoming group claim.
+
+Then map group → role: `Groups → Platform-Admins → Role mapping → platform-admin`.
+
+**(2) Keycloak → JWT.** Roles appear in tokens via protocol mappers. In this
+POC: `Clients → poc-webapp → Client scopes → roles` already includes the
+*realm roles* mapper, so any role you give alice shows up as
+`realm_access.roles` in her token — and, because RFC 8693 re-issues the token
+for the same `sub`, in the **OBO token too**. Groups can also be exposed
+directly with a *Group Membership* mapper (`groups: ["/Platform-Admins"]`).
+
+**(3) Claim → permission.** Enforcement reads the claim wherever the request
+lands. Per-tool example for mcp-mock (full version in
+[ARCHITECTURE.md §Authorization](ARCHITECTURE.md)):
+
+```python
+TOOL_POLICY = {
+    # tool            required role        what it guards
+    "query_database": "db-reader",       # SELECT on the reporting DB
+    "delete_deployment": "platform-admin",
+    "call_billing_api": "billing-user",  # outbound API with cost
+}
+
+def _authorize(name: str, claims: dict) -> None:
+    required = TOOL_POLICY.get(name)
+    if required is None:
+        return                                    # unrestricted tool
+    roles = claims.get("realm_access", {}).get("roles", [])
+    if required not in roles:
+        raise PermissionError(
+            f"tool '{name}' requires role '{required}' — "
+            f"user {claims['sub']} (via {claims.get('act', {}).get('sub')}) "
+            f"has {roles}")
+```
+
+The same claim drives every kind of backend permission, because the OBO token
+travels on **every** hop:
+
+| Resource | Where the check runs | What it reads |
+|---|---|---|
+| MCP tool (this repo) | tool server, per `tools/call` | `realm_access.roles` |
+| Database access | the MCP tool that opens the connection — maps role → DB account/row-level policy | roles or `groups` |
+| Internal API | the API's own gateway validates the *same* OBO token | roles + `scope` |
+| Route-level cutoff | agentgateway CEL rule, *before* anything runs | any claim: `jwt.realm_access.roles.exists(r, r == "ai-platform-user")` |
+| Sensitive ops | HITL gate — pause and ask the human, regardless of role | tool name + `sub` (who to ask) |
+
+Key property: the decision is always *"is **alice** allowed to do this via
+this agent?"* — never "is the agent allowed". Two users running the identical
+agent on the identical task get different tool surfaces, and the audit trail
+attributes every call to the human who owns it.
+
+> ⚠️ Corollary: anything that ignores the token breaks the model. An LLM
+> response cache keyed only on the prompt would happily serve alice's cached
+> answer to bob — if you add caching, the cache key must include `sub`.
+
+None of steps (1)–(3) are enforced in this POC by default (transport is
+demonstrated, enforcement is documented): the exact activation steps are in
+[ARCHITECTURE.md §Authorization](ARCHITECTURE.md).
+
 ## How to work on it
 
 ### Repo layout
