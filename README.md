@@ -59,6 +59,34 @@ Everything runs locally in Docker/Podman — no cloud, no VPN, no TLS setup.
 Demo users: `alice/alice123`, `bob/bob123`. Keycloak admin: `admin/admin`.
 All secrets in this repo are demo values for the local stack only.
 
+### OBO vs obo-exchange — pattern vs service
+
+Two easily-confused names:
+
+- **OBO** is a *pattern*, not software: "On-Behalf-Of", the RFC 8693 flow
+  where a user token is exchanged for a delegated token
+  `{sub=user, act=agent}`. It is an OAuth2 grant type
+  (`urn:ietf:params:oauth:grant-type:token-exchange`) and the exchange itself
+  is performed **by Keycloak**.
+- **obo-exchange** is the small application in this repo that brokers it
+  (`services/obo-exchange/server.py`, ~330 lines of FastAPI). It does not
+  mint anything itself — its whole job is:
+  1. **Hold the `exchange-app` client secret** — it is the only container
+     that has it (skeleton-key pattern). If the agent held that secret, a
+     compromised agent could mint delegated tokens for *any* user.
+  2. Call Keycloak with it: `/exchange` (RFC 8693) and `/refresh` (renewal,
+     `act` preserved).
+  3. Serve `/authz` for a gateway's extAuth filter: "allow + here are the
+     headers to inject".
+
+It is small on purpose: zero business logic → easy to audit, minimal attack
+surface, and in Kubernetes a tight NetworkPolicy (only the gateway and the
+agent may reach it). Valid production alternatives that remove the service
+entirely: the gateway's extAuth filter talking to Keycloak directly, or —
+with Keycloak 26.2+ standard token exchange (v2) — clients calling Keycloak
+themselves. The dedicated broker remains the right choice when you want the
+secret in exactly one place and centralized audit of every exchange.
+
 ### Component map
 
 ```mermaid
