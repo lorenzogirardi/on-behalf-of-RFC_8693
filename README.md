@@ -59,6 +59,94 @@ Everything runs locally in Docker/Podman — no cloud, no VPN, no TLS setup.
 Demo users: `alice/alice123`, `bob/bob123`. Keycloak admin: `admin/admin`.
 All secrets in this repo are demo values for the local stack only.
 
+### Component map
+
+```mermaid
+flowchart LR
+    subgraph client["Client"]
+        B([Browser<br/>alice])
+    end
+    subgraph gateway["Gateway zone"]
+        W["webapp :8080<br/><i>simulates extAuth</i>"]
+        O["obo-exchange :8081<br/><b>sole holder of<br/>exchange-app secret</b>"]
+    end
+    subgraph idp["Identity"]
+        K["Keycloak :8180<br/>realm poc · RFC 8693"]
+    end
+    subgraph backend["Agent backend"]
+        A["agent :8082<br/>tool-calling loop"]
+        R[("Redis :6379<br/>grants AES-256-GCM")]
+        L["litellm :4001<br/>OpenAI-compat proxy"]
+        M["mcp-mock :8083<br/>4 demo tools"]
+    end
+    subgraph llm["LLM"]
+        E["llama.cpp<br/>qwen-local"]
+    end
+    subgraph obs["Observability"]
+        P["Prometheus :9090"]
+        G["Grafana :3000"]
+    end
+
+    B -->|"1· login (ROPC)"| W
+    W -->|"2· user JWT"| K
+    W -->|"3· subject_token"| O
+    O -->|"4· RFC 8693 exchange"| K
+    W -->|"5· OBO JWT only"| A
+    A <-->|grants + traces| R
+    A -->|"OBO JWT as bearer"| L
+    L --> E
+    A -->|"OBO JWT on every tools/call"| M
+    P -.->|"scrape /metrics"| W & O & A & M & K & R
+    G -.-> P
+
+    style O fill:#4d2a00,stroke:#f7934f,color:#f7934f
+    style K fill:#002a4d,stroke:#4f8ef7,color:#4f8ef7
+    style R fill:#002a1a,stroke:#3dd68c,color:#3dd68c
+```
+
+### Sequence — one delegated run
+
+```mermaid
+sequenceDiagram
+    actor U as alice
+    participant W as webapp<br/>(gateway)
+    participant K as Keycloak
+    participant O as obo-exchange
+    participant A as agent
+    participant L as litellm → LLM
+    participant M as mcp-mock
+
+    U->>W: task + credentials
+    W->>K: ROPC login
+    K-->>W: user JWT {sub=alice, aud=exchange-app}
+
+    W->>O: POST /exchange (subject_token = user JWT)
+    O->>K: client_credentials → actor token (agent-service)
+    O->>K: RFC 8693: subject + actor + exchange-app secret
+    K-->>O: OBO JWT {sub=alice, act.sub=agent-service} + refresh_token
+    O-->>W: OBO grant
+
+    W->>A: POST /a2a/run (Bearer OBO JWT — user JWT never forwarded)
+    A->>A: seal grant (AES-256-GCM) → Redis
+
+    loop tool-calling (≤6 turns)
+        A->>L: chat/completions (Bearer OBO JWT)
+        L-->>A: tool call or final answer
+        opt tool requested
+            A->>M: tools/call (Bearer OBO JWT)
+            Note over M: sees sub=alice, act=agent-service<br/>→ can enforce per-user policy
+            M-->>A: result (traced with identity)
+        end
+        opt near expiry
+            A->>O: /refresh — act preserved, RT rotates
+        end
+    end
+
+    A-->>W: result + run_id
+    W->>A: GET /admin/instances/{run_id}/identity + /trace
+    A-->>U: answer + audit trail
+```
+
 ## How to use it
 
 ### Prerequisites
